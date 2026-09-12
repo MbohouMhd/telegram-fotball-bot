@@ -1,839 +1,399 @@
-# bot.py
-# Version corrigée du bot Telegram d'analyse football.
-# Remplace le contenu de ton bot.py par ce fichier.
-
 import os
-import re
 import math
-import asyncio
-from datetime import datetime
-from typing import Any
+import re
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 load_dotenv()
 
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-API_KEY = os.getenv("API_FOOTBALL_KEY", "")
-BASE_URL = "https://v3.football.api-sports.io"
-
-if not BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN est manquant.")
-if not API_KEY:
-    raise RuntimeError("API_FOOTBALL_KEY est manquant.")
-
-HEADERS = {"x-apisports-key": API_KEY}
-
-
-class FootballAPI:
-    def __init__(self):
-        self.client = httpx.AsyncClient(
-            base_url=BASE_URL, headers=HEADERS, timeout=30.0
-        )
-
-    async def close(self):
-        await self.client.aclose()
-
-    async def get(self, path: str, **params) -> dict[str, Any]:
-        params = {k: v for k, v in params.items() if v is not None and v != ""}
-        response = await self.client.get(path, params=params)
-        response.raise_for_status()
-        data = response.json()
-        if data.get("errors"):
-            raise RuntimeError(str(data["errors"]))
-        return data
-
-    async def search_league(self, name):
-        return (await self.get("/leagues", search=name)).get("response", [])
-
-    async def fixtures(self, **params):
-        return (await self.get("/fixtures", **params)).get("response", [])
-
-    async def events(self, fixture_id):
-        return (await self.get("/fixtures/events", fixture=fixture_id)).get("response", [])
-
-    async def injuries(self, fixture_id):
-        return (await self.get("/injuries", fixture=fixture_id)).get("response", [])
-
-    async def players(self, team_id, season):
-        return (await self.get("/players", team=team_id, season=season)).get("response", [])
-
-
-api = FootballAPI()
-
-
-def clean_name(name):
-    return re.sub(r"\s+", " ", name.strip())
-
-
-def normalize(name):
-    return re.sub(r"[^a-z0-9]", "", name.lower())
-
-
-def percentage(value):
-    return f"{round(value * 100)}%"
-
-
-def parse_request(text):
-    text = re.sub(r"^/analyse\s*", "", text.strip(), flags=re.I)
-    parts = [p.strip() for p in text.split("|")]
-
-    if len(parts) != 3:
-        raise ValueError(
-            "Format incorrect.\n\n"
-            "Utilise :\n"
-            "/analyse Équipe 1 vs Équipe 2 | Compétition | AAAA-MM-JJ\n\n"
-            "Exemple :\n"
-            "/analyse PSG vs Marseille | Ligue 1 | 2026-09-20"
-        )
-
-    teams = re.split(r"\s+vs\.?\s+|\s+v\s+", parts[0], flags=re.I)
-
-    if len(teams) != 2:
-        raise ValueError("Utilise le format « Équipe 1 vs Équipe 2 ».")
-
-    try:
-        datetime.strptime(parts[2], "%Y-%m-%d")
-    except ValueError:
-        raise ValueError("La date doit être au format AAAA-MM-JJ.")
-
-    return clean_name(teams[0]), clean_name(teams[1]), clean_name(parts[1]), parts[2]
-
-
-def season_for_date(date_text):
-    date = datetime.strptime(date_text, "%Y-%m-%d")
-    return date.year if date.month >= 7 else date.year - 1
-
-
-async def resolve_fixture(home, away, competition, date_text):
-    leagues = await api.search_league(competition)
-
-    if not leagues:
-        raise ValueError(f"Compétition introuvable : {competition}")
-
-    target = normalize(competition)
-
-    exact = [
-        x for x in leagues
-        if normalize(x.get("league", {}).get("name", "")) == target
-    ]
-
-    league = (exact[0] if exact else leagues[0])["league"]
-    league_id = league["id"]
-    season = season_for_date(date_text)
-
-    try:
-        fixtures = await api.fixtures(
-            league=league_id,
-            season=season,
-            date=date_text
-        )
-    except RuntimeError as error:
-        if "Free plans do not have access" in str(error):
-            raise ValueError(
-                f"⚠️ Ton forfait API-Football gratuit ne permet pas "
-                f"d'accéder à la saison {season}.\n\n"
-                "Le bot fonctionne, mais l'API bloque cette saison. "
-                "Il faut une source ou un plan donnant accès aux données actuelles."
-            )
-        raise
-
-    if not fixtures:
-        fixtures = await api.fixtures(date=date_text)
-
-    nh, na = normalize(home), normalize(away)
-
-    for f in fixtures:
-        h = normalize(f["teams"]["home"]["name"])
-        a = normalize(f["teams"]["away"]["name"])
-
-        if (nh in h or h in nh) and (na in a or a in na):
-            return f, league_id, season
-
-    for f in fixtures:
-        h = normalize(f["teams"]["home"]["name"])
-        a = normalize(f["teams"]["away"]["name"])
-
-        if (nh in a or a in nh) and (na in h or h in na):
-            return f, league_id, season
-
-    raise ValueError(
-        f"Match introuvable le {date_text}.\n"
-        f"Équipes : {home} vs {away}\n"
-        f"Compétition : {league['name']}\n"
-        f"Saison recherchée : {season}"
-    )
-
-
-async def recent_matches(team_id, season, last=5):
-    try:
-        matches = await api.fixtures(team=team_id, last=last)
-    except Exception:
-        return []
-
-    return [
-        x for x in matches
-        if x.get("league", {}).get("season") == season
-    ][:last]
-
-
-def result_for_team(fixture, team_id):
-    is_home = fixture["teams"]["home"]["id"] == team_id
-
-    gf = fixture["goals"]["home"] if is_home else fixture["goals"]["away"]
-    ga = fixture["goals"]["away"] if is_home else fixture["goals"]["home"]
-
-    opponent = (
-        fixture["teams"]["away"]["name"]
-        if is_home
-        else fixture["teams"]["home"]["name"]
-    )
-
-    if gf is None or ga is None:
-        return None
-
-    result = "V" if gf > ga else "N" if gf == ga else "D"
-
-    return {
-        "result": result,
-        "gf": gf,
-        "ga": ga,
-        "opponent": opponent,
-        "date": fixture["fixture"]["date"][:10],
-    }
-
-
-def summarize_form(matches, team_id):
-    rows = [result_for_team(x, team_id) for x in matches]
-    rows = [x for x in rows if x]
-
-    if not rows:
-        return {
-            "rows": [],
-            "ppg": 0,
-            "gf": 0,
-            "ga": 0,
-            "btts": 0,
-            "over25": 0,
-        }
-
-    points = sum(
-        3 if x["result"] == "V"
-        else 1 if x["result"] == "N"
-        else 0
-        for x in rows
-    )
-
-    return {
-        "rows": rows,
-        "ppg": points / len(rows),
-        "gf": sum(x["gf"] for x in rows) / len(rows),
-        "ga": sum(x["ga"] for x in rows) / len(rows),
-        "btts": sum(
-            1 for x in rows
-            if x["gf"] > 0 and x["ga"] > 0
-        ) / len(rows),
-        "over25": sum(
-            1 for x in rows
-            if x["gf"] + x["ga"] >= 3
-        ) / len(rows),
-    }
-
-
-def venue_form(matches, team_id, home):
-    selected = [
-        f for f in matches
-        if (f["teams"]["home"]["id"] == team_id) == home
-    ]
-    return summarize_form(selected, team_id)
-
-
-def poisson(k, expected):
-    return math.exp(-expected) * expected ** k / math.factorial(k)
-
-
-def poisson_1x2(home_expected, away_expected):
-    home_win = draw = away_win = 0.0
-
-    for hg in range(8):
-        for ag in range(8):
-            p = poisson(hg, home_expected) * poisson(ag, away_expected)
-
-            if hg > ag:
-                home_win += p
-            elif hg == ag:
-                draw += p
-            else:
-                away_win += p
-
-    total = home_win + draw + away_win
-
-    return (
-        home_win / total,
-        draw / total,
-        away_win / total,
-    )
-
-
-def model_probability(hf, af, hv, av, h2h_home, h2h_away):
-    home_attack = hv["gf"] or hf["gf"] or 1
-    home_defense = hv["ga"] or hf["ga"] or 1
-    away_attack = av["gf"] or af["gf"] or 1
-    away_defense = av["ga"] or af["ga"] or 1
-
-    expected_home = (
-        0.58 * home_attack
-        + 0.42 * away_defense
-        + 0.20
-    )
-
-    expected_away = (
-        0.58 * away_attack
-        + 0.42 * home_defense
-        - 0.05
-    )
-
-    form_difference = hf["ppg"] - af["ppg"]
-
-    expected_home *= 1 + form_difference * 0.08
-    expected_away *= 1 - form_difference * 0.08
-
-    if h2h_home + h2h_away > 0:
-        difference = h2h_home - h2h_away
-        expected_home *= 1 + difference * 0.025
-        expected_away *= 1 - difference * 0.025
-
-    expected_home = max(0.15, expected_home)
-    expected_away = max(0.10, expected_away)
-
-    ph, pd, pa = poisson_1x2(
-        expected_home,
-        expected_away
-    )
-
-    return (
-        ph,
-        pd,
-        pa,
-        expected_home,
-        expected_away,
-    )
-
-
-def market_probabilities(expected_home, expected_away):
-    total = expected_home + expected_away
-
-    under15 = poisson(0, total) + poisson(1, total)
-
-    under25 = (
-        poisson(0, total)
-        + poisson(1, total)
-        + poisson(2, total)
-    )
-
-    p0h = poisson(0, expected_home)
-    p0a = poisson(0, expected_away)
-
-    return {
-        "over15": 1 - under15,
-        "over25": 1 - under25,
-        "btts": 1 - p0h - p0a + p0h * p0a,
-    }
-
-
-def probable_score(expected_home, expected_away):
-    best_probability = -1
-    best_home = 0
-    best_away = 0
-
-    for hg in range(7):
-        for ag in range(7):
-            p = poisson(hg, expected_home) * poisson(ag, expected_away)
-
-            if p > best_probability:
-                best_probability = p
-                best_home = hg
-                best_away = ag
-
-    return best_home, best_away, best_probability
-
-
-def confidence(probability):
-    return max(
-        50,
-        min(
-            88,
-            round(50 + abs(probability - 0.5) * 70)
-        )
-    )
-
-
-async def player_form(team_id, season):
-    try:
-        players = await api.players(team_id, season)
-    except Exception:
-        return []
-
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")  # optional: historical/injury fallback
+
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN manquant dans Railway Variables.")
+
+ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer"
+AF_BASE = "https://v3.football.api-sports.io"
+
+
+# ------------------------------------------------------------
+# ESPN = source principale pour les matchs actuels.
+# Elle ne demande pas de clé API.
+# ------------------------------------------------------------
+
+COMPETITIONS = {
+    "premier league": "eng.1",
+    "pl": "eng.1",
+    "la liga": "esp.1",
+    "liga": "esp.1",
+    "serie a": "ita.1",
+    "bundesliga": "ger.1",
+    "ligue 1": "fra.1",
+    "champions league": "uefa.champions",
+    "ucl": "uefa.champions",
+    "europa league": "uefa.europa",
+    "conference league": "uefa.europa.conf",
+}
+
+# Quelques noms courants pour améliorer la recherche.
+ALIASES = {
+    "man united": "Manchester United",
+    "man utd": "Manchester United",
+    "manchester utd": "Manchester United",
+    "man city": "Manchester City",
+    "psg": "Paris Saint-Germain",
+    "paris sg": "Paris Saint-Germain",
+    "barca": "Barcelona",
+    "fc barcelona": "Barcelona",
+    "atleti": "Atletico Madrid",
+    "atletico": "Atletico Madrid",
+    "inter": "Inter Milan",
+    "inter milan": "Inter Milan",
+    "ac milan": "AC Milan",
+    "bayern": "Bayern Munich",
+    "dortmund": "Borussia Dortmund",
+}
+
+
+def norm(s: str) -> str:
+    s = s.lower().strip()
+    s = re.sub(r"[^\w\s-]", "", s, flags=re.UNICODE)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def parse_match(text: str):
+    # Accepte: Equipe A - Equipe B / Equipe A vs Equipe B
+    parts = re.split(r"\s+(?:vs?\.?|contre)\s+|\s+-\s+", text, maxsplit=1, flags=re.I)
+    if len(parts) != 2:
+        return None, None
+    return parts[0].strip(), parts[1].strip()
+
+
+async def get_json(url, params=None, headers=None):
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        r = await client.get(url, params=params, headers=headers)
+        if r.status_code >= 400:
+            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
+        return r.json()
+
+
+async def espn_scoreboard(league, date=None):
+    params = {}
+    if date:
+        params["dates"] = date.replace("-", "")
+    return await get_json(f"{ESPN_BASE}/{league}/scoreboard", params=params)
+
+
+async def espn_search_team(team_name, league):
+    data = await espn_scoreboard(league)
+    target = norm(ALIASES.get(norm(team_name), team_name))
     candidates = []
 
-    for item in players:
-        player = item.get("player", {})
-        goals = 0
-        appearances = 0
+    for event in data.get("events", []):
+        for comp in event.get("competitions", []):
+            for c in comp.get("competitors", []):
+                team = c.get("team", {})
+                name = team.get("displayName", "")
+                short = team.get("shortDisplayName", "")
+                if target == norm(name) or target == norm(short):
+                    return team.get("id"), name
+                if target in norm(name) or norm(name) in target:
+                    candidates.append((team.get("id"), name))
 
-        for stat in item.get("statistics") or []:
-            goals_data = stat.get("goals") or {}
-            games = stat.get("games") or {}
+    # Si l'équipe n'est pas dans le scoreboard du jour,
+    # on essaie la recherche ESPN.
+    data = await get_json(
+        "https://site.api.espn.com/apis/site/v2/sports/soccer/teams",
+        params={"region": "us", "lang": "en", "limit": 1000},
+    )
+    for t in data.get("sports", []):
+        for league_obj in t.get("leagues", []):
+            for team in league_obj.get("teams", []):
+                team = team.get("team", team)
+                name = team.get("displayName", "")
+                if target == norm(name) or target in norm(name):
+                    return team.get("id"), name
 
-            goals += goals_data.get("total") or 0
-            appearances += games.get("appearences") or 0
-
-        if goals:
-            candidates.append(
-                (
-                    goals,
-                    appearances,
-                    player.get("name", "Joueur")
-                )
-            )
-
-    candidates.sort(reverse=True)
-
-    return candidates[:3]
+    return candidates[0] if candidates else (None, None)
 
 
-async def recent_goal_scorers(matches, team_id):
-    scorers = {}
-
-    for match in matches:
+async def espn_events_for_league(league, days=14):
+    now = datetime.now(timezone.utc)
+    events = []
+    for i in range(-days, days + 1):
+        d = (now + timedelta(days=i)).strftime("%Y-%m-%d")
         try:
-            events = await api.events(match["fixture"]["id"])
+            data = await espn_scoreboard(league, d)
+            events.extend(data.get("events", []))
+        except Exception:
+            pass
+    # dédoublonnage
+    out = {}
+    for e in events:
+        out[str(e.get("id"))] = e
+    return list(out.values())
+
+
+def event_teams(event):
+    comp = (event.get("competitions") or [{}])[0]
+    home = away = None
+    for c in comp.get("competitors", []):
+        if c.get("homeAway") == "home":
+            home = c
+        elif c.get("homeAway") == "away":
+            away = c
+    return home, away
+
+
+def team_name(c):
+    return ((c or {}).get("team") or {}).get("displayName", "?")
+
+
+def score(c):
+    try:
+        return int((c or {}).get("score", 0))
+    except Exception:
+        return 0
+
+
+async def find_current_fixture(home_query, away_query):
+    # Recherche dans les principales compétitions.
+    for league in COMPETITIONS.values():
+        try:
+            events = await espn_events_for_league(league, days=10)
         except Exception:
             continue
-
-        for event in events:
-            if event.get("type") != "Goal":
+        for e in events:
+            h, a = event_teams(e)
+            if not h or not a:
                 continue
-
-            if event.get("team", {}).get("id") != team_id:
-                continue
-
-            name = (event.get("player") or {}).get("name")
-
-            if name:
-                scorers[name] = scorers.get(name, 0) + 1
-
-    return sorted(
-        scorers.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )
+            hn, an = norm(team_name(h)), norm(team_name(a))
+            hq = norm(ALIASES.get(norm(home_query), home_query))
+            aq = norm(ALIASES.get(norm(away_query), away_query))
+            if ((hq in hn or hn in hq) and (aq in an or an in aq)):
+                return e, league
+    return None, None
 
 
-def injuries_for_team(injuries, team_id):
-    result = []
+async def recent_team_matches(league, team_id, limit=5):
+    now = datetime.now(timezone.utc)
+    all_events = []
+    for i in range(0, 90, 7):
+        d1 = (now - timedelta(days=i + 6)).strftime("%Y-%m-%d")
+        d2 = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+        try:
+            data = await get_json(
+                f"{ESPN_BASE}/{league}/scoreboard",
+                params={"dates": f"{d1}-{d2}"},
+            )
+            all_events.extend(data.get("events", []))
+        except Exception:
+            pass
 
-    for injury in injuries:
-        if injury.get("team", {}).get("id") != team_id:
+    seen = {}
+    for e in all_events:
+        seen[str(e.get("id"))] = e
+
+    matches = []
+    for e in seen.values():
+        if e.get("status", {}).get("type", {}).get("state") != "post":
+            continue
+        h, a = event_teams(e)
+        if not h or not a:
+            continue
+        if str(h.get("team", {}).get("id")) != str(team_id) and str(a.get("team", {}).get("id")) != str(team_id):
             continue
 
-        player = injury.get("player") or {}
+        is_home = str(h.get("team", {}).get("id")) == str(team_id)
+        gf = score(h if is_home else a)
+        ga = score(a if is_home else h)
+        matches.append({
+            "date": e.get("date", ""),
+            "opponent": team_name(a if is_home else h),
+            "home": is_home,
+            "gf": gf,
+            "ga": ga,
+            "result": "V" if gf > ga else "N" if gf == ga else "D",
+        })
 
-        name = player.get("name", "Joueur")
-        reason = (
-            player.get("reason")
-            or player.get("type")
-            or "indisponibilité"
+    matches.sort(key=lambda x: x["date"], reverse=True)
+    return matches[:limit]
+
+
+def summarize_form(matches):
+    if not matches:
+        return {"v": 0, "n": 0, "d": 0, "gf": 0, "ga": 0, "points": 0}
+    v = sum(x["result"] == "V" for x in matches)
+    n = sum(x["result"] == "N" for x in matches)
+    d = sum(x["result"] == "D" for x in matches)
+    gf = sum(x["gf"] for x in matches)
+    ga = sum(x["ga"] for x in matches)
+    return {"v": v, "n": n, "d": d, "gf": gf, "ga": ga, "points": v * 3 + n}
+
+
+def poisson(lam, k):
+    return math.exp(-lam) * (lam ** k) / math.factorial(k)
+
+
+def probabilities(home_form, away_form):
+    h_att = max(0.25, home_form["gf"] / max(1, len(home_form["matches"])))
+    h_def = max(0.25, home_form["ga"] / max(1, len(home_form["matches"])))
+    a_att = max(0.25, away_form["gf"] / max(1, len(away_form["matches"])))
+    a_def = max(0.25, away_form["ga"] / max(1, len(away_form["matches"])))
+
+    lam_h = max(0.25, 0.58 * h_att + 0.42 * a_def + 0.25)
+    lam_a = max(0.20, 0.58 * a_att + 0.42 * h_def)
+
+    ph = pd = pa = 0.0
+    best = (0, 0, 0.0)
+    for hg in range(0, 7):
+        for ag in range(0, 7):
+            p = poisson(lam_h, hg) * poisson(lam_a, ag)
+            if hg > ag:
+                ph += p
+            elif hg == ag:
+                pd += p
+            else:
+                pa += p
+            if p > best[2]:
+                best = (hg, ag, p)
+
+    total = ph + pd + pa
+    return {
+        "home": ph / total * 100,
+        "draw": pd / total * 100,
+        "away": pa / total * 100,
+        "score": f"{best[0]}-{best[1]}",
+        "over15": 100 * (1 - sum(poisson(lam_h, i) for i in range(2)) * sum(poisson(lam_a, i) for i in range(2))),
+        "lam_h": lam_h,
+        "lam_a": lam_a,
+    }
+
+
+async def analyse(home_query, away_query):
+    event, league = await find_current_fixture(home_query, away_query)
+
+    if not event:
+        raise RuntimeError(
+            "Match actuel introuvable dans les compétitions prises en charge. "
+            "Essaie le nom officiel des équipes et indique la compétition."
         )
 
-        result.append(f"{name} ({reason})")
+    h, a = event_teams(event)
+    home_id = (h.get("team") or {}).get("id")
+    away_id = (a.get("team") or {}).get("id")
+    home_name = team_name(h)
+    away_name = team_name(a)
 
-    return result
+    hm = await recent_team_matches(league, home_id, 5)
+    am = await recent_team_matches(league, away_id, 5)
 
+    hf = summarize_form(hm)
+    af = summarize_form(am)
+    hf["matches"] = hm
+    af["matches"] = am
 
-def form_string(summary):
-    return " ".join(
-        x["result"]
-        for x in summary["rows"]
-    ) or "N/D"
+    p = probabilities(hf, af)
 
+    kickoff = event.get("date", "date inconnue")
+    status = event.get("status", {}).get("type", {}).get("description", "")
+    comp_name = event.get("season", {}).get("displayName", "") or league
 
-async def build_analysis(home, away, competition, date_text):
-    fixture, league_id, season = await resolve_fixture(
-        home,
-        away,
-        competition,
-        date_text
-    )
-
-    home_id = fixture["teams"]["home"]["id"]
-    away_id = fixture["teams"]["away"]["id"]
-
-    actual_home = fixture["teams"]["home"]["name"]
-    actual_away = fixture["teams"]["away"]["name"]
-
-    home_matches, away_matches = await asyncio.gather(
-        recent_matches(home_id, season, 5),
-        recent_matches(away_id, season, 5),
-    )
-
-    hf = summarize_form(home_matches, home_id)
-    af = summarize_form(away_matches, away_id)
-
-    home_all, away_all = await asyncio.gather(
-        recent_matches(home_id, season, 10),
-        recent_matches(away_id, season, 10),
-    )
-
-    hv = venue_form(home_all, home_id, True)
-    av = venue_form(away_all, away_id, False)
-
-    try:
-        h2h = await api.fixtures(
-            h2h=f"{home_id}-{away_id}",
-            last=5
-        )
-    except Exception:
-        h2h = []
-
-    h2h_home = 0
-    h2h_draw = 0
-    h2h_away = 0
-    h2h_rows = []
-
-    for match in h2h:
-        hg = match["goals"]["home"]
-        ag = match["goals"]["away"]
-
-        if hg is None or ag is None:
-            continue
-
-        match_home_id = match["teams"]["home"]["id"]
-
-        if hg == ag:
-            h2h_draw += 1
-        elif (
-            (match_home_id == home_id and hg > ag)
-            or
-            (match_home_id != home_id and ag > hg)
-        ):
-            h2h_home += 1
-        else:
-            h2h_away += 1
-
-        h2h_rows.append(
-            (
-                match["teams"]["home"]["name"],
-                hg,
-                ag,
-                match["teams"]["away"]["name"],
-            )
+    def form_text(name, f):
+        results = " ".join(x["result"] for x in f["matches"]) if f["matches"] else "N/D"
+        return (
+            f"**{name}** : {results}\n"
+            f"  Buts marqués : {f['gf']} | encaissés : {f['ga']} | "
+            f"V-N-D : {f['v']}-{f['n']}-{f['d']}"
         )
 
-    try:
-        injuries = await api.injuries(
-            fixture["fixture"]["id"]
-        )
-    except Exception:
-        injuries = []
+    favorite = home_name if p["home"] >= max(p["draw"], p["away"]) else away_name
 
-    home_injuries = injuries_for_team(
-        injuries,
-        home_id
+    return (
+        f"⚽ **Analyse actuelle : {home_name} vs {away_name}**\n\n"
+        f"🏆 Compétition : {comp_name}\n"
+        f"🕒 Coup d'envoi : {kickoff}\n"
+        f"📌 Statut : {status}\n\n"
+        f"📊 **Forme récente (5 derniers matchs)**\n"
+        f"{form_text(home_name, hf)}\n\n"
+        f"{form_text(away_name, af)}\n\n"
+        f"🤖 **Probabilités du modèle**\n"
+        f"🏠 {home_name} : **{p['home']:.1f}%**\n"
+        f"🤝 Match nul : **{p['draw']:.1f}%**\n"
+        f"✈️ {away_name} : **{p['away']:.1f}%**\n\n"
+        f"🎯 Score le plus probable : **{p['score']}**\n"
+        f"⚽ Over 1,5 buts : **{p['over15']:.1f}%**\n\n"
+        f"💡 **Choix prudent :** {favorite} ou nul (1X/ X2 selon le favori).\n\n"
+        f"⚠️ Les blessures/suspensions détaillées et certains H2H ne sont pas "
+        f"garantis par cette source gratuite. Ne considère pas les pourcentages "
+        f"comme une certitude de pari."
     )
-
-    away_injuries = injuries_for_team(
-        injuries,
-        away_id
-    )
-
-    ph, pd, pa, expected_home, expected_away = model_probability(
-        hf,
-        af,
-        hv,
-        av,
-        h2h_home,
-        h2h_away,
-    )
-
-    markets = market_probabilities(
-        expected_home,
-        expected_away
-    )
-
-    score_home, score_away, score_probability = probable_score(
-        expected_home,
-        expected_away
-    )
-
-    home_players, away_players = await asyncio.gather(
-        player_form(home_id, season),
-        player_form(away_id, season),
-    )
-
-    home_scorers, away_scorers = await asyncio.gather(
-        recent_goal_scorers(home_matches, home_id),
-        recent_goal_scorers(away_matches, away_id),
-    )
-
-    double_1x = ph + pd
-    double_x2 = pd + pa
-
-    bets = [
-        (
-            double_1x,
-            f"Double chance 1X — {percentage(double_1x)}"
-        ),
-        (
-            double_x2,
-            f"Double chance X2 — {percentage(double_x2)}"
-        ),
-        (
-            markets["over15"],
-            f"Plus de 1,5 buts — {percentage(markets['over15'])}"
-        ),
-        (
-            markets["over25"],
-            f"Plus de 2,5 buts — {percentage(markets['over25'])}"
-        ),
-        (
-            markets["btts"],
-            f"Les deux équipes marquent — {percentage(markets['btts'])}"
-        ),
-    ]
-
-    bets.sort(
-        key=lambda x: x[0],
-        reverse=True
-    )
-
-    lines = [
-        "⚽ <b>ANALYSE DU MATCH</b>",
-        f"<b>{actual_home}</b> 🆚 <b>{actual_away}</b>",
-        f"🏆 {fixture['league']['name']}",
-        f"📅 {date_text}",
-        "",
-        "📊 <b>1. 5 DERNIERS MATCHS</b>",
-        f"• {actual_home}: {form_string(hf)} | "
-        f"{hf['gf']:.2f} buts marqués/m | "
-        f"{hf['ga']:.2f} encaissés/m",
-        f"• {actual_away}: {form_string(af)} | "
-        f"{af['gf']:.2f} buts marqués/m | "
-        f"{af['ga']:.2f} encaissés/m",
-        "",
-        "🛡️ <b>2. ATTAQUE / DÉFENSE</b>",
-        f"• {actual_home}: {hf['ppg']:.2f} PPM | "
-        f"BTTS {percentage(hf['btts'])} | "
-        f"+2,5 {percentage(hf['over25'])}",
-        f"• {actual_away}: {af['ppg']:.2f} PPM | "
-        f"BTTS {percentage(af['btts'])} | "
-        f"+2,5 {percentage(af['over25'])}",
-        f"• Domicile {actual_home}: {hv['ppg']:.2f} PPM",
-        f"• Extérieur {actual_away}: {av['ppg']:.2f} PPM",
-        "",
-        "🤝 <b>3. CONFRONTATIONS DIRECTES</b>",
-    ]
-
-    if h2h_rows:
-        lines.append(
-            f"• {h2h_home} victoire(s) {actual_home}, "
-            f"{h2h_draw} nul(s), "
-            f"{h2h_away} victoire(s) {actual_away}"
-        )
-
-        for h, hg, ag, a in h2h_rows[:5]:
-            lines.append(f"  {h} {hg}-{ag} {a}")
-    else:
-        lines.append("• Données H2H indisponibles.")
-
-    lines += [
-        "",
-        "⭐ <b>4. JOUEURS CLÉS</b>",
-    ]
-
-    if home_players:
-        lines.append(
-            f"• {actual_home}: " +
-            ", ".join(
-                f"{name} ({goals} buts)"
-                for goals, apps, name in home_players
-            )
-        )
-
-    if away_players:
-        lines.append(
-            f"• {actual_away}: " +
-            ", ".join(
-                f"{name} ({goals} buts)"
-                for goals, apps, name in away_players
-            )
-        )
-
-    if home_scorers:
-        lines.append(
-            f"• Buteurs récents {actual_home}: " +
-            ", ".join(
-                f"{name} x{goals}"
-                for name, goals in home_scorers[:3]
-            )
-        )
-
-    if away_scorers:
-        lines.append(
-            f"• Buteurs récents {actual_away}: " +
-            ", ".join(
-                f"{name} x{goals}"
-                for name, goals in away_scorers[:3]
-            )
-        )
-
-    lines += [
-        "",
-        "🏟️ <b>5. AVANTAGE DU TERRAIN</b>",
-        f"• {actual_home} reçoit. Le modèle applique un avantage domicile modéré.",
-        "",
-        "🚑 <b>6. BLESSURES / SUSPENSIONS</b>",
-        f"• {actual_home}: "
-        f"{', '.join(home_injuries) if home_injuries else 'aucune indisponibilité retournée par l’API.'}",
-        f"• {actual_away}: "
-        f"{', '.join(away_injuries) if away_injuries else 'aucune indisponibilité retournée par l’API.'}",
-        "",
-        "📈 <b>PROBABILITÉS</b>",
-        f"• Victoire {actual_home}: <b>{percentage(ph)}</b>",
-        f"• Match nul: <b>{percentage(pd)}</b>",
-        f"• Victoire {actual_away}: <b>{percentage(pa)}</b>",
-        "",
-        f"🎯 <b>SCORE PROBABLE: {score_home}-{score_away}</b>",
-        f"Probabilité du score exact: {percentage(score_probability)}",
-        "",
-        "💰 <b>PARIS STATISTIQUES INTÉRESSANTS</b>",
-    ]
-
-    for probability, label in bets[:3]:
-        lines.append(
-            f"• {label} | confiance {confidence(probability)}%"
-        )
-
-    overall = max(ph, pd, pa)
-
-    lines += [
-        "",
-        f"🧠 <b>CONFIANCE GLOBALE: {confidence(overall)}%</b>",
-        "",
-        "ℹ️ Les probabilités sont des estimations statistiques, "
-        "pas une garantie de résultat.",
-        "📐 Modèle : forme récente + buts marqués/encaissés + "
-        "domicile/extérieur + H2H + joueurs disponibles.",
-    ]
-
-    return "\n".join(lines)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "⚽ <b>BOT D'ANALYSE FOOTBALL</b>\n\n"
-        "Utilise :\n"
-        "/analyse Équipe 1 vs Équipe 2 | Compétition | AAAA-MM-JJ\n\n"
-        "Exemple :\n"
-        "/analyse PSG vs Marseille | Ligue 1 | 2026-09-20",
-        parse_mode="HTML",
+        "👋 **Bot d'analyse football opérationnel.**\n\n"
+        "Envoie par exemple :\n"
+        "`Manchester United - Chelsea`\n\n"
+        "Tu peux aussi préciser la compétition :\n"
+        "`Manchester United - Chelsea | Premier League`",
+        parse_mode="Markdown",
     )
 
 
-async def analyze(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        home, away, competition, date_text = parse_request(
-            update.message.text or ""
+async def analyse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = " ".join(context.args).strip()
+    if not text:
+        await update.message.reply_text(
+            "Utilisation : /analyse Manchester United - Chelsea"
         )
-    except ValueError as error:
-        await update.message.reply_text(str(error))
         return
+    await do_analysis(update, text)
 
-    message = await update.message.reply_text(
-        "⏳ Je recherche les statistiques...\n"
-        "📊 Forme\n"
-        "⚽ Attaque/défense\n"
-        "🤝 H2H\n"
-        "🚑 Absences\n"
-        "🧮 Calcul du modèle..."
-    )
 
+async def do_analysis(update, text):
+    await update.message.reply_text("🔎 Recherche des données actuelles...")
     try:
-        report = await build_analysis(
-            home,
-            away,
-            competition,
-            date_text
-        )
-
-        chunks = [
-            report[i:i + 3900]
-            for i in range(0, len(report), 3900)
-        ]
-
-        await message.delete()
-
-        for chunk in chunks:
-            await update.message.reply_text(
-                chunk,
-                parse_mode="HTML"
+        # Retire une éventuelle mention de compétition pour garder une commande simple.
+        text_clean = re.split(r"\s*\|\s*", text, maxsplit=1)[0]
+        home, away = parse_match(text_clean)
+        if not home or not away:
+            raise RuntimeError(
+                "Format incorrect. Utilise : `Equipe A - Equipe B`."
             )
-
-    except Exception as error:
-        await message.edit_text(
-            "❌ <b>Impossible de produire l'analyse.</b>\n\n"
-            f"Détail : {str(error)[:1500]}",
-            parse_mode="HTML"
+        result = await analyse(home, away)
+        await update.message.reply_text(result, parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(
+            "❌ **Impossible de produire l'analyse.**\n\n"
+            f"Détail : {e}\n\n"
+            "💡 Le bot utilise maintenant une source de données actuelles "
+            "indépendante de la saison 2026 d'API-Football."
+            ,
+            parse_mode="Markdown",
         )
 
 
-async def error_handler(update, context):
-    print("ERREUR TELEGRAM :", context.error)
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    if text.startswith("/"):
+        return
+    await do_analysis(update, text)
 
 
-async def main():
-    application = (
-        Application
-        .builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    application.add_handler(
-        CommandHandler("start", start)
-    )
-
-    application.add_handler(
-        CommandHandler("analyse", analyze)
-    )
-
-    application.add_handler(
-        MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            analyze
-        )
-    )
-
-    application.add_error_handler(error_handler)
-
-    print("✅ Bot Telegram démarré.")
-
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    finally:
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
-        await api.close()
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("analyse", analyse_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    print("Bot démarré.")
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
