@@ -1,347 +1,600 @@
 import os
-import math
 import re
+import math
 from datetime import datetime, timedelta, timezone
 
 import httpx
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
 load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-API_FOOTBALL_KEY = os.getenv("API_FOOTBALL_KEY")  # optional: historical/injury fallback
+SPORTMONKS_TOKEN = os.getenv("SPORTMONKS_TOKEN")
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError("TELEGRAM_BOT_TOKEN manquant dans Railway Variables.")
 
-ESPN_BASE = "https://site.api.espn.com/apis/site/v2/sports/soccer"
-AF_BASE = "https://v3.football.api-sports.io"
+if not SPORTMONKS_TOKEN:
+    raise RuntimeError(
+        "SPORTMONKS_TOKEN manquant dans Railway Variables. "
+        "Crée ton token Sportmonks puis ajoute-le dans Railway."
+    )
+
+BASE_URL = "https://api.sportmonks.com/v3/football"
 
 
-# ------------------------------------------------------------
-# ESPN = source principale pour les matchs actuels.
-# Elle ne demande pas de clé API.
-# ------------------------------------------------------------
+# ============================================================
+# OUTILS
+# ============================================================
 
-COMPETITIONS = {
-    "premier league": "eng.1",
-    "pl": "eng.1",
-    "la liga": "esp.1",
-    "liga": "esp.1",
-    "serie a": "ita.1",
-    "bundesliga": "ger.1",
-    "ligue 1": "fra.1",
-    "champions league": "uefa.champions",
-    "ucl": "uefa.champions",
-    "europa league": "uefa.europa",
-    "conference league": "uefa.europa.conf",
-}
-
-# Quelques noms courants pour améliorer la recherche.
-ALIASES = {
-    "man united": "Manchester United",
-    "man utd": "Manchester United",
-    "manchester utd": "Manchester United",
-    "man city": "Manchester City",
-    "psg": "Paris Saint-Germain",
-    "paris sg": "Paris Saint-Germain",
-    "barca": "Barcelona",
-    "fc barcelona": "Barcelona",
-    "atleti": "Atletico Madrid",
-    "atletico": "Atletico Madrid",
-    "inter": "Inter Milan",
-    "inter milan": "Inter Milan",
-    "ac milan": "AC Milan",
-    "bayern": "Bayern Munich",
-    "dortmund": "Borussia Dortmund",
-}
-
-
-def norm(s: str) -> str:
-    s = s.lower().strip()
-    s = re.sub(r"[^\w\s-]", "", s, flags=re.UNICODE)
-    s = re.sub(r"\s+", " ", s)
-    return s
+def norm(text: str) -> str:
+    text = (text or "").lower().strip()
+    text = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", text)
 
 
 def parse_match(text: str):
-    # Accepte: Equipe A - Equipe B / Equipe A vs Equipe B
-    parts = re.split(r"\s+(?:vs?\.?|contre)\s+|\s+-\s+", text, maxsplit=1, flags=re.I)
+    text = re.split(r"\s*\|\s*", text, maxsplit=1)[0].strip()
+    parts = re.split(
+        r"\s+(?:vs?\.?|contre)\s+|\s+-\s+|\s+–\s+|\s+—\s+",
+        text,
+        maxsplit=1,
+        flags=re.I,
+    )
     if len(parts) != 2:
         return None, None
     return parts[0].strip(), parts[1].strip()
 
 
-async def get_json(url, params=None, headers=None):
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-        r = await client.get(url, params=params, headers=headers)
-        if r.status_code >= 400:
-            raise RuntimeError(f"HTTP {r.status_code}: {r.text[:300]}")
-        return r.json()
+async def api_get(path: str, params=None):
+    params = dict(params or {})
+    params["api_token"] = SPORTMONKS_TOKEN
+
+    async with httpx.AsyncClient(timeout=25) as client:
+        response = await client.get(BASE_URL + path, params=params)
+
+    if response.status_code >= 400:
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text[:500]
+        raise RuntimeError(
+            f"Sportmonks HTTP {response.status_code}: {detail}"
+        )
+
+    data = response.json()
+
+    if isinstance(data, dict) and data.get("message"):
+        # Certaines réponses Sportmonks mettent l'erreur dans message.
+        if not data.get("data"):
+            raise RuntimeError(str(data["message"]))
+
+    return data
 
 
-async def espn_scoreboard(league, date=None):
-    params = {}
-    if date:
-        params["dates"] = date.replace("-", "")
-    return await get_json(f"{ESPN_BASE}/{league}/scoreboard", params=params)
+def collection(data):
+    if isinstance(data, dict):
+        value = data.get("data", [])
+        return value if isinstance(value, list) else [value]
+    return data if isinstance(data, list) else []
 
 
-async def espn_search_team(team_name, league):
-    data = await espn_scoreboard(league)
-    target = norm(ALIASES.get(norm(team_name), team_name))
-    candidates = []
+# ============================================================
+# RECHERCHE DES ÉQUIPES / MATCHS
+# ============================================================
 
-    for event in data.get("events", []):
-        for comp in event.get("competitions", []):
-            for c in comp.get("competitors", []):
-                team = c.get("team", {})
-                name = team.get("displayName", "")
-                short = team.get("shortDisplayName", "")
-                if target == norm(name) or target == norm(short):
-                    return team.get("id"), name
-                if target in norm(name) or norm(name) in target:
-                    candidates.append((team.get("id"), name))
-
-    # Si l'équipe n'est pas dans le scoreboard du jour,
-    # on essaie la recherche ESPN.
-    data = await get_json(
-        "https://site.api.espn.com/apis/site/v2/sports/soccer/teams",
-        params={"region": "us", "lang": "en", "limit": 1000},
+async def search_teams(name: str):
+    # Endpoint de recherche d'équipes.
+    data = await api_get(
+        "/teams/search/" + name,
+        {"include": "country"},
     )
-    for t in data.get("sports", []):
-        for league_obj in t.get("leagues", []):
-            for team in league_obj.get("teams", []):
-                team = team.get("team", team)
-                name = team.get("displayName", "")
-                if target == norm(name) or target in norm(name):
-                    return team.get("id"), name
-
-    return candidates[0] if candidates else (None, None)
+    return collection(data)
 
 
-async def espn_events_for_league(league, days=14):
+def team_matches_name(team, query):
+    q = norm(query)
+    names = [
+        team.get("name", ""),
+        team.get("short_code", ""),
+        team.get("short_name", ""),
+    ]
+    names = [norm(x) for x in names if x]
+
+    if q in names:
+        return 100
+    if any(q in x or x in q for x in names):
+        return 80
+    words = q.split()
+    score = sum(any(w in x for x in names) for w in words)
+    return score * 10
+
+
+async def resolve_team(name: str):
+    teams = await search_teams(name)
+    if not teams:
+        raise RuntimeError(
+            f"Équipe introuvable : {name}. Essaie son nom officiel."
+        )
+
+    teams.sort(key=lambda t: team_matches_name(t, name), reverse=True)
+    return teams[0]
+
+
+async def find_fixture(home_name: str, away_name: str):
+    home = await resolve_team(home_name)
+    away = await resolve_team(away_name)
+
+    home_id = home.get("id")
+    away_id = away.get("id")
+
     now = datetime.now(timezone.utc)
-    events = []
-    for i in range(-days, days + 1):
-        d = (now + timedelta(days=i)).strftime("%Y-%m-%d")
-        try:
-            data = await espn_scoreboard(league, d)
-            events.extend(data.get("events", []))
-        except Exception:
-            pass
-    # dédoublonnage
-    out = {}
-    for e in events:
-        out[str(e.get("id"))] = e
-    return list(out.values())
+    start = now.strftime("%Y-%m-%d")
+    end = (now + timedelta(days=30)).strftime("%Y-%m-%d")
 
+    # Un seul appel pour chercher les matchs entre les deux équipes
+    # dans une fenêtre proche de la date actuelle.
+    data = await api_get(
+        f"/fixtures/between/{start}/{end}",
+        {
+            "include": "participants;league;season;state;scores;venue",
+            "per_page": 100,
+        },
+    )
 
-def event_teams(event):
-    comp = (event.get("competitions") or [{}])[0]
-    home = away = None
-    for c in comp.get("competitors", []):
-        if c.get("homeAway") == "home":
-            home = c
-        elif c.get("homeAway") == "away":
-            away = c
-    return home, away
+    fixtures = collection(data)
 
-
-def team_name(c):
-    return ((c or {}).get("team") or {}).get("displayName", "?")
-
-
-def score(c):
-    try:
-        return int((c or {}).get("score", 0))
-    except Exception:
-        return 0
-
-
-async def find_current_fixture(home_query, away_query):
-    # Recherche dans les principales compétitions.
-    for league in COMPETITIONS.values():
-        try:
-            events = await espn_events_for_league(league, days=10)
-        except Exception:
+    candidates = []
+    for f in fixtures:
+        participants = f.get("participants") or []
+        ids = {p.get("id") for p in participants}
+        if home_id not in ids or away_id not in ids:
             continue
-        for e in events:
-            h, a = event_teams(e)
-            if not h or not a:
+
+        home_participant = next(
+            (p for p in participants if p.get("id") == home_id), None
+        )
+        away_participant = next(
+            (p for p in participants if p.get("id") == away_id), None
+        )
+
+        # Sportmonks expose généralement la position home/away
+        # dans participants.meta.location.
+        if home_participant:
+            loc = (home_participant.get("meta") or {}).get("location")
+            if loc and loc != "home":
                 continue
-            hn, an = norm(team_name(h)), norm(team_name(a))
-            hq = norm(ALIASES.get(norm(home_query), home_query))
-            aq = norm(ALIASES.get(norm(away_query), away_query))
-            if ((hq in hn or hn in hq) and (aq in an or an in aq)):
-                return e, league
-    return None, None
 
+        if away_participant:
+            loc = (away_participant.get("meta") or {}).get("location")
+            if loc and loc != "away":
+                continue
 
-async def recent_team_matches(league, team_id, limit=5):
-    now = datetime.now(timezone.utc)
-    all_events = []
-    for i in range(0, 90, 7):
-        d1 = (now - timedelta(days=i + 6)).strftime("%Y-%m-%d")
-        d2 = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+        candidates.append(f)
+
+    if not candidates:
+        # Deuxième essai : recherche H2H.
+        data = await api_get(
+            f"/fixtures/head-to-head/{home_id}/{away_id}",
+            {
+                "include": "participants;league;season;state;scores;venue",
+                "per_page": 100,
+            },
+        )
+        candidates = collection(data)
+
+        upcoming = []
+        for f in candidates:
+            try:
+                dt = datetime.fromisoformat(
+                    f["starting_at"].replace(" ", "T")
+                ).replace(tzinfo=timezone.utc)
+                if dt >= now - timedelta(hours=6):
+                    upcoming.append((dt, f))
+            except Exception:
+                pass
+
+        if upcoming:
+            upcoming.sort(key=lambda x: x[0])
+            candidates = [x[1] for x in upcoming]
+
+    if not candidates:
+        raise RuntimeError(
+            "Match actuel introuvable. Vérifie les noms des équipes, "
+            "la compétition et la date du match."
+        )
+
+    # Le match le plus proche dans le futur.
+    def fixture_dt(f):
         try:
-            data = await get_json(
-                f"{ESPN_BASE}/{league}/scoreboard",
-                params={"dates": f"{d1}-{d2}"},
-            )
-            all_events.extend(data.get("events", []))
+            return datetime.fromisoformat(
+                f["starting_at"].replace(" ", "T")
+            ).replace(tzinfo=timezone.utc)
         except Exception:
-            pass
+            return datetime.max.replace(tzinfo=timezone.utc)
 
-    seen = {}
-    for e in all_events:
-        seen[str(e.get("id"))] = e
+    future = [f for f in candidates if fixture_dt(f) >= now - timedelta(hours=6)]
+    if future:
+        return sorted(future, key=fixture_dt)[0], home, away
 
-    matches = []
-    for e in seen.values():
-        if e.get("status", {}).get("type", {}).get("state") != "post":
+    return sorted(candidates, key=fixture_dt, reverse=True)[0], home, away
+
+
+# ============================================================
+# DONNÉES D'UNE RENCONTRE
+# ============================================================
+
+async def fixture_details(fixture_id: int):
+    return (
+        await api_get(
+            f"/fixtures/{fixture_id}",
+            {
+                "include": (
+                    "participants;scores;events;lineups.player;"
+                    "statistics.type;league;season;state;venue;"
+                    "xGFixture;predictions.type;sidelined"
+                )
+            },
+        )
+    ).get("data", {})
+
+
+async def recent_matches(team_id: int, limit=5):
+    now = datetime.now(timezone.utc)
+    start = (now - timedelta(days=120)).strftime("%Y-%m-%d")
+    end = now.strftime("%Y-%m-%d")
+
+    data = await api_get(
+        f"/fixtures/between/{start}/{end}/{team_id}",
+        {
+            "include": "participants;scores;state;league",
+            "per_page": 100,
+        },
+    )
+
+    fixtures = collection(data)
+
+    finished = []
+    for f in fixtures:
+        state = f.get("state") or {}
+        state_name = norm(
+            state.get("name", "")
+            or state.get("short_name", "")
+            or state.get("developer_name", "")
+        )
+
+        # On conserve uniquement les matchs terminés.
+        if state_name and not any(
+            x in state_name
+            for x in ("finished", "full time", "ft", "after")
+        ):
             continue
-        h, a = event_teams(e)
-        if not h or not a:
-            continue
-        if str(h.get("team", {}).get("id")) != str(team_id) and str(a.get("team", {}).get("id")) != str(team_id):
+
+        if not f.get("scores"):
             continue
 
-        is_home = str(h.get("team", {}).get("id")) == str(team_id)
-        gf = score(h if is_home else a)
-        ga = score(a if is_home else h)
-        matches.append({
-            "date": e.get("date", ""),
-            "opponent": team_name(a if is_home else h),
-            "home": is_home,
-            "gf": gf,
-            "ga": ga,
-            "result": "V" if gf > ga else "N" if gf == ga else "D",
-        })
+        participants = f.get("participants") or []
+        me = next((p for p in participants if p.get("id") == team_id), None)
+        opp = next((p for p in participants if p.get("id") != team_id), None)
+        if not me or not opp:
+            continue
 
-    matches.sort(key=lambda x: x["date"], reverse=True)
-    return matches[:limit]
+        scores = f.get("scores") or []
+
+        def get_score(participant_id, description):
+            for s in scores:
+                if (
+                    s.get("participant_id") == participant_id
+                    and norm(s.get("description", "")) == norm(description)
+                ):
+                    try:
+                        return int(s.get("score", {}).get("goals", 0))
+                    except Exception:
+                        pass
+            return None
+
+        gf = get_score(team_id, "CURRENT")
+        ga = get_score(opp.get("id"), "CURRENT")
+
+        if gf is None or ga is None:
+            # Fallback sur le premier score compatible.
+            vals = {}
+            for s in scores:
+                try:
+                    vals[s.get("participant_id")] = int(
+                        s.get("score", {}).get("goals", 0)
+                    )
+                except Exception:
+                    pass
+            gf = vals.get(team_id)
+            ga = vals.get(opp.get("id"))
+
+        if gf is None or ga is None:
+            continue
+
+        location = (me.get("meta") or {}).get("location", "")
+        result = "V" if gf > ga else "N" if gf == ga else "D"
+
+        finished.append(
+            {
+                "date": f.get("starting_at", ""),
+                "opponent": opp.get("name", "?"),
+                "gf": gf,
+                "ga": ga,
+                "result": result,
+                "home": location == "home",
+            }
+        )
+
+    finished.sort(key=lambda x: x["date"], reverse=True)
+    return finished[:limit]
 
 
-def summarize_form(matches):
+def form_summary(matches):
     if not matches:
-        return {"v": 0, "n": 0, "d": 0, "gf": 0, "ga": 0, "points": 0}
-    v = sum(x["result"] == "V" for x in matches)
-    n = sum(x["result"] == "N" for x in matches)
-    d = sum(x["result"] == "D" for x in matches)
-    gf = sum(x["gf"] for x in matches)
-    ga = sum(x["ga"] for x in matches)
-    return {"v": v, "n": n, "d": d, "gf": gf, "ga": ga, "points": v * 3 + n}
+        return {
+            "v": 0,
+            "n": 0,
+            "d": 0,
+            "gf": 0,
+            "ga": 0,
+            "points": 0,
+        }
 
+    v = sum(m["result"] == "V" for m in matches)
+    n = sum(m["result"] == "N" for m in matches)
+    d = sum(m["result"] == "D" for m in matches)
+    gf = sum(m["gf"] for m in matches)
+    ga = sum(m["ga"] for m in matches)
+
+    return {
+        "v": v,
+        "n": n,
+        "d": d,
+        "gf": gf,
+        "ga": ga,
+        "points": v * 3 + n,
+    }
+
+
+# ============================================================
+# MODÈLE DE PRONOSTIC
+# ============================================================
 
 def poisson(lam, k):
     return math.exp(-lam) * (lam ** k) / math.factorial(k)
 
 
-def probabilities(home_form, away_form):
-    h_att = max(0.25, home_form["gf"] / max(1, len(home_form["matches"])))
-    h_def = max(0.25, home_form["ga"] / max(1, len(home_form["matches"])))
-    a_att = max(0.25, away_form["gf"] / max(1, len(away_form["matches"])))
-    a_def = max(0.25, away_form["ga"] / max(1, len(away_form["matches"])))
+def calculate_probabilities(home_matches, away_matches):
+    hf = form_summary(home_matches)
+    af = form_summary(away_matches)
 
-    lam_h = max(0.25, 0.58 * h_att + 0.42 * a_def + 0.25)
-    lam_a = max(0.20, 0.58 * a_att + 0.42 * h_def)
+    hn = max(1, len(home_matches))
+    an = max(1, len(away_matches))
 
-    ph = pd = pa = 0.0
-    best = (0, 0, 0.0)
-    for hg in range(0, 7):
-        for ag in range(0, 7):
-            p = poisson(lam_h, hg) * poisson(lam_a, ag)
+    h_attack = hf["gf"] / hn
+    h_defense = hf["ga"] / hn
+    a_attack = af["gf"] / an
+    a_defense = af["ga"] / an
+
+    # Avantage domicile modéré.
+    lambda_home = max(
+        0.20,
+        0.60 * h_attack + 0.40 * a_defense + 0.25,
+    )
+    lambda_away = max(
+        0.15,
+        0.60 * a_attack + 0.40 * h_defense,
+    )
+
+    p_home = p_draw = p_away = 0.0
+    best_score = (0, 0, 0.0)
+
+    for hg in range(0, 8):
+        for ag in range(0, 8):
+            p = poisson(lambda_home, hg) * poisson(lambda_away, ag)
+
             if hg > ag:
-                ph += p
+                p_home += p
             elif hg == ag:
-                pd += p
+                p_draw += p
             else:
-                pa += p
-            if p > best[2]:
-                best = (hg, ag, p)
+                p_away += p
 
-    total = ph + pd + pa
+            if p > best_score[2]:
+                best_score = (hg, ag, p)
+
+    total = p_home + p_draw + p_away
+
+    # Probabilité over 1.5.
+    under_15 = poisson(lambda_home, 0) * poisson(lambda_away, 0) + (
+        poisson(lambda_home, 1) * poisson(lambda_away, 0)
+    ) + (
+        poisson(lambda_home, 0) * poisson(lambda_away, 1)
+    )
+    over_15 = 1 - under_15
+
+    # BTTS.
+    btts = (1 - math.exp(-lambda_home)) * (
+        1 - math.exp(-lambda_away)
+    )
+
     return {
-        "home": ph / total * 100,
-        "draw": pd / total * 100,
-        "away": pa / total * 100,
-        "score": f"{best[0]}-{best[1]}",
-        "over15": 100 * (1 - sum(poisson(lam_h, i) for i in range(2)) * sum(poisson(lam_a, i) for i in range(2))),
-        "lam_h": lam_h,
-        "lam_a": lam_a,
+        "home": p_home / total * 100,
+        "draw": p_draw / total * 100,
+        "away": p_away / total * 100,
+        "score": f"{best_score[0]}-{best_score[1]}",
+        "over15": over_15 * 100,
+        "btts": btts * 100,
+        "lambda_home": lambda_home,
+        "lambda_away": lambda_away,
     }
 
 
-async def analyse(home_query, away_query):
-    event, league = await find_current_fixture(home_query, away_query)
+def extract_sportmonks_predictions(fixture):
+    predictions = fixture.get("predictions") or []
+    out = {}
 
-    if not event:
-        raise RuntimeError(
-            "Match actuel introuvable dans les compétitions prises en charge. "
-            "Essaie le nom officiel des équipes et indique la compétition."
+    for p in predictions:
+        typ = p.get("type") or {}
+        name = norm(
+            typ.get("developer_name", "")
+            or typ.get("name", "")
+        )
+        values = p.get("predictions") or {}
+
+        if "fulltime result probability" in name or "fulltime_result_probability" in name:
+            out["1"] = values.get("home")
+            out["x"] = values.get("draw")
+            out["2"] = values.get("away")
+
+        elif "both teams to score" in name or "btts" in name:
+            out["btts_yes"] = values.get("yes")
+            out["btts_no"] = values.get("no")
+
+    return out
+
+
+def extract_xg(fixture):
+    xg = fixture.get("xgfixture") or []
+    result = {"home": None, "away": None}
+
+    for item in xg:
+        loc = item.get("location")
+        value = (item.get("data") or {}).get("value")
+        if loc in result:
+            result[loc] = value
+
+    return result
+
+
+# ============================================================
+# ANALYSE
+# ============================================================
+
+async def analyse(home_query, away_query):
+    fixture, home, away = await find_fixture(home_query, away_query)
+
+    fixture_id = fixture.get("id")
+    details = await fixture_details(fixture_id)
+
+    participants = details.get("participants") or fixture.get("participants") or []
+
+    # Identifiants réels depuis le fixture.
+    home_p = next(
+        (p for p in participants if (p.get("meta") or {}).get("location") == "home"),
+        None,
+    )
+    away_p = next(
+        (p for p in participants if (p.get("meta") or {}).get("location") == "away"),
+        None,
+    )
+
+    if not home_p or not away_p:
+        # fallback avec les équipes résolues
+        home_p = next((p for p in participants if p.get("id") == home.get("id")), None)
+        away_p = next((p for p in participants if p.get("id") == away.get("id")), None)
+
+    home_id = home_p.get("id") if home_p else home.get("id")
+    away_id = away_p.get("id") if away_p else away.get("id")
+
+    home_matches = await recent_matches(home_id, 5)
+    away_matches = await recent_matches(away_id, 5)
+
+    model = calculate_probabilities(home_matches, away_matches)
+
+    sm_predictions = extract_sportmonks_predictions(details)
+    xg = extract_xg(details)
+
+    home_name = home_p.get("name") if home_p else home.get("name")
+    away_name = away_p.get("name") if away_p else away.get("name")
+
+    league = (details.get("league") or {}).get("name", "Compétition inconnue")
+    season = (details.get("season") or {}).get("name", "")
+    venue = (details.get("venue") or {}).get("name", "")
+    kickoff = details.get("starting_at") or fixture.get("starting_at", "")
+
+    hf = form_summary(home_matches)
+    af = form_summary(away_matches)
+
+    # Si le module Predictions Sportmonks est disponible, on l'affiche
+    # séparément de notre modèle.
+    sm_line = ""
+    if any(v is not None for v in sm_predictions.values()):
+        sm_line = (
+            "\n🧠 **Probabilités Sportmonks**\n"
+            f"🏠 1 : {sm_predictions.get('1', 'N/D')}%\n"
+            f"🤝 X : {sm_predictions.get('x', 'N/D')}%\n"
+            f"✈️ 2 : {sm_predictions.get('2', 'N/D')}%\n"
         )
 
-    h, a = event_teams(event)
-    home_id = (h.get("team") or {}).get("id")
-    away_id = (a.get("team") or {}).get("id")
-    home_name = team_name(h)
-    away_name = team_name(a)
+    xg_line = ""
+    if xg["home"] is not None or xg["away"] is not None:
+        xg_line = (
+            f"\n📈 xG disponibles : "
+            f"{home_name} {xg['home'] if xg['home'] is not None else 'N/D'} | "
+            f"{away_name} {xg['away'] if xg['away'] is not None else 'N/D'}\n"
+        )
 
-    hm = await recent_team_matches(league, home_id, 5)
-    am = await recent_team_matches(league, away_id, 5)
+    favorite = (
+        home_name
+        if model["home"] >= max(model["draw"], model["away"])
+        else away_name
+    )
 
-    hf = summarize_form(hm)
-    af = summarize_form(am)
-    hf["matches"] = hm
-    af["matches"] = am
+    confidence = max(model["home"], model["draw"], model["away"])
 
-    p = probabilities(hf, af)
-
-    kickoff = event.get("date", "date inconnue")
-    status = event.get("status", {}).get("type", {}).get("description", "")
-    comp_name = event.get("season", {}).get("displayName", "") or league
-
-    def form_text(name, f):
-        results = " ".join(x["result"] for x in f["matches"]) if f["matches"] else "N/D"
+    def form_line(name, matches, f):
+        seq = " ".join(m["result"] for m in matches) if matches else "N/D"
         return (
-            f"**{name}** : {results}\n"
-            f"  Buts marqués : {f['gf']} | encaissés : {f['ga']} | "
+            f"**{name}** : `{seq}`\n"
+            f"⚽ {f['gf']} buts marqués | 🛡️ {f['ga']} encaissés | "
             f"V-N-D : {f['v']}-{f['n']}-{f['d']}"
         )
 
-    favorite = home_name if p["home"] >= max(p["draw"], p["away"]) else away_name
-
     return (
-        f"⚽ **Analyse actuelle : {home_name} vs {away_name}**\n\n"
-        f"🏆 Compétition : {comp_name}\n"
-        f"🕒 Coup d'envoi : {kickoff}\n"
-        f"📌 Statut : {status}\n\n"
-        f"📊 **Forme récente (5 derniers matchs)**\n"
-        f"{form_text(home_name, hf)}\n\n"
-        f"{form_text(away_name, af)}\n\n"
-        f"🤖 **Probabilités du modèle**\n"
-        f"🏠 {home_name} : **{p['home']:.1f}%**\n"
-        f"🤝 Match nul : **{p['draw']:.1f}%**\n"
-        f"✈️ {away_name} : **{p['away']:.1f}%**\n\n"
-        f"🎯 Score le plus probable : **{p['score']}**\n"
-        f"⚽ Over 1,5 buts : **{p['over15']:.1f}%**\n\n"
-        f"💡 **Choix prudent :** {favorite} ou nul (1X/ X2 selon le favori).\n\n"
-        f"⚠️ Les blessures/suspensions détaillées et certains H2H ne sont pas "
-        f"garantis par cette source gratuite. Ne considère pas les pourcentages "
-        f"comme une certitude de pari."
+        f"⚽ **ANALYSE : {home_name} vs {away_name}**\n\n"
+        f"🏆 {league} {('• ' + season) if season else ''}\n"
+        f"🕒 {kickoff}\n"
+        f"🏟️ {venue or 'Stade non indiqué'}\n\n"
+        f"📊 **5 derniers matchs**\n"
+        f"{form_line(home_name, home_matches, hf)}\n\n"
+        f"{form_line(away_name, away_matches, af)}\n\n"
+        f"🤖 **Notre modèle**\n"
+        f"🏠 {home_name} : **{model['home']:.1f}%**\n"
+        f"🤝 Nul : **{model['draw']:.1f}%**\n"
+        f"✈️ {away_name} : **{model['away']:.1f}%**\n"
+        f"🎯 Score le plus probable : **{model['score']}**\n"
+        f"⚽ Over 1,5 : **{model['over15']:.1f}%**\n"
+        f"🔄 BTTS : **{model['btts']:.1f}%**\n"
+        f"{xg_line}"
+        f"{sm_line}\n"
+        f"💡 **Lecture :** avantage théorique à **{favorite}**.\n"
+        f"📌 Confiance du modèle 1X2 : **{confidence:.1f}%**\n\n"
+        f"⚠️ Une probabilité n'est jamais une garantie de pari. "
+        f"Les données disponibles dépendent des compétitions couvertes par ton abonnement Sportmonks."
     )
 
 
+# ============================================================
+# TELEGRAM
+# ============================================================
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 **Bot d'analyse football opérationnel.**\n\n"
-        "Envoie par exemple :\n"
+        "👋 **Bot football Sportmonks opérationnel.**\n\n"
+        "Envoie simplement :\n"
         "`Manchester United - Chelsea`\n\n"
-        "Tu peux aussi préciser la compétition :\n"
-        "`Manchester United - Chelsea | Premier League`",
+        "ou :\n"
+        "`PSG - Marseille`",
         parse_mode="Markdown",
     )
 
@@ -350,48 +603,63 @@ async def analyse_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = " ".join(context.args).strip()
     if not text:
         await update.message.reply_text(
-            "Utilisation : /analyse Manchester United - Chelsea"
-        )
-        return
-    await do_analysis(update, text)
-
-
-async def do_analysis(update, text):
-    await update.message.reply_text("🔎 Recherche des données actuelles...")
-    try:
-        # Retire une éventuelle mention de compétition pour garder une commande simple.
-        text_clean = re.split(r"\s*\|\s*", text, maxsplit=1)[0]
-        home, away = parse_match(text_clean)
-        if not home or not away:
-            raise RuntimeError(
-                "Format incorrect. Utilise : `Equipe A - Equipe B`."
-            )
-        result = await analyse(home, away)
-        await update.message.reply_text(result, parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text(
-            "❌ **Impossible de produire l'analyse.**\n\n"
-            f"Détail : {e}\n\n"
-            "💡 Le bot utilise maintenant une source de données actuelles "
-            "indépendante de la saison 2026 d'API-Football."
-            ,
+            "Utilisation : `/analyse Manchester United - Chelsea`",
             parse_mode="Markdown",
         )
+        return
+    await run_analysis(update, text)
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
-    if text.startswith("/"):
-        return
-    await do_analysis(update, text)
+    if text:
+        await run_analysis(update, text)
+
+
+async def run_analysis(update: Update, text: str):
+    await update.message.reply_text(
+        "🔎 Recherche des données Sportmonks actuelles..."
+    )
+
+    try:
+        home, away = parse_match(text)
+
+        if not home or not away:
+            raise RuntimeError(
+                "Format incorrect. Utilise : `Equipe A - Equipe B`."
+            )
+
+        result = await analyse(home, away)
+        await update.message.reply_text(
+            result,
+            parse_mode="Markdown",
+        )
+
+    except Exception as e:
+        await update.message.reply_text(
+            "❌ **Impossible de produire l'analyse.**\n\n"
+            f"Détail : {e}\n\n"
+            "Vérifie surtout que ta variable Railway "
+            "`SPORTMONKS_TOKEN` contient bien ton token Sportmonks "
+            "et que la compétition demandée est couverte par ton plan.",
+            parse_mode="Markdown",
+        )
 
 
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .build()
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("analyse", analyse_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
-    print("Bot démarré.")
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler)
+    )
+
+    print("Bot Sportmonks démarré.")
     app.run_polling(drop_pending_updates=True)
 
 
